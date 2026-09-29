@@ -74,6 +74,32 @@ static bool compare_track(OP1ATrack *left, OP1ATrack *right)
     return left->GetDataDef() < right->GetDataDef();
 }
 
+// A timecode track counts in frames, but when clip wrapping the clip edit rate becomes the
+// essence sampling rate (eg. 48000/1 for PCM). Durations and origins handed to the timecode
+// track are in clip edit units and must be converted to the frame rate, otherwise the timecode
+// duration is inflated by the sampling rate / frame rate ratio.
+// Both helpers return the value unchanged when the rates match, ie. when frame wrapping.
+static bool tc_rate_differs(Rational clip_rate, Rational tc_rate)
+{
+    return clip_rate.numerator != tc_rate.numerator || clip_rate.denominator != tc_rate.denominator;
+}
+
+static int64_t tc_track_duration(int64_t duration, Rational clip_rate, Rational tc_rate)
+{
+    if (duration < 0 || !tc_rate_differs(clip_rate, tc_rate))
+        return duration;
+
+    return convert_duration(clip_rate, duration, tc_rate, ROUND_AUTO);
+}
+
+static int64_t tc_track_position(int64_t position, Rational clip_rate, Rational tc_rate)
+{
+    if (position < 0 || !tc_rate_differs(clip_rate, tc_rate))
+        return position;
+
+    return convert_position(clip_rate, position, tc_rate, ROUND_AUTO);
+}
+
 
 
 mxfUMID OP1AFile::CreatePackageUID()
@@ -929,20 +955,22 @@ void OP1AFile::CreateHeaderMetadata()
         timecode_track->setTrackName(TIMECODE_TRACK_NAME);
         timecode_track->setTrackID(mTrackIdHelper.GetId("TimecodeTrack"));
         timecode_track->setTrackNumber(0);
-        timecode_track->setEditRate(mEditRate);
+        timecode_track->setEditRate(mFrameRate);
         timecode_track->setOrigin(0);
+
+        int64_t mp_tc_duration = tc_track_duration(material_track_duration, mEditRate, mFrameRate);
 
         // Preface - ContentStorage - MaterialPackage - Timecode Track - Sequence
         Sequence *sequence = new Sequence(mHeaderMetadata);
         timecode_track->setSequence(sequence);
         sequence->setDataDefinition(MXF_DDEF_L(Timecode));
-        sequence->setDuration(material_track_duration);
+        sequence->setDuration(mp_tc_duration);
 
         // Preface - ContentStorage - MaterialPackage - Timecode Track - TimecodeComponent
         TimecodeComponent *timecode_component = new TimecodeComponent(mHeaderMetadata);
         sequence->appendStructuralComponents(timecode_component);
         timecode_component->setDataDefinition(MXF_DDEF_L(Timecode));
-        timecode_component->setDuration(material_track_duration);
+        timecode_component->setDuration(mp_tc_duration);
         timecode_component->setRoundedTimecodeBase(mStartTimecode.GetRoundedTCBase());
         timecode_component->setDropFrame(mStartTimecode.IsDropFrame());
         timecode_component->setStartTimecode(mStartTimecode.GetOffset());
@@ -969,22 +997,26 @@ void OP1AFile::CreateHeaderMetadata()
             timecode_track->setTrackName(TIMECODE_TRACK_NAME);
             timecode_track->setTrackID(901);
             timecode_track->setTrackNumber(0);
-            timecode_track->setEditRate(mEditRate);
-            timecode_track->setOrigin(source_track_origin);
+            timecode_track->setEditRate(mFrameRate);
+
+            int64_t sp_tc_origin   = tc_track_position(source_track_origin, mEditRate, mFrameRate);
+            int64_t sp_tc_duration = tc_track_duration(source_track_duration, mEditRate, mFrameRate);
+
+            timecode_track->setOrigin(sp_tc_origin);
 
             // Preface - ContentStorage - SourcePackage - Timecode Track - Sequence
             Sequence *sequence = new Sequence(mHeaderMetadata);
             timecode_track->setSequence(sequence);
             sequence->setDataDefinition(MXF_DDEF_L(Timecode));
-            sequence->setDuration(source_track_duration);
+            sequence->setDuration(sp_tc_duration);
 
             // Preface - ContentStorage - SourcePackage - Timecode Track - TimecodeComponent
             TimecodeComponent *timecode_component = new TimecodeComponent(mHeaderMetadata);
             sequence->appendStructuralComponents(timecode_component);
             timecode_component->setDataDefinition(MXF_DDEF_L(Timecode));
-            timecode_component->setDuration(source_track_duration);
+            timecode_component->setDuration(sp_tc_duration);
             Timecode sp_start_timecode = mStartTimecode;
-            sp_start_timecode.AddOffset(- source_track_origin, mFrameRate);
+            sp_start_timecode.AddOffset(- sp_tc_origin, mFrameRate);
             timecode_component->setRoundedTimecodeBase(sp_start_timecode.GetRoundedTCBase());
             timecode_component->setDropFrame(sp_start_timecode.IsDropFrame());
             timecode_component->setStartTimecode(sp_start_timecode.GetOffset());
@@ -1296,26 +1328,37 @@ void OP1AFile::UpdateTrackMetadata(GenericPackage *package, int64_t origin, int6
         if (!track)
             continue;
 
-        track->setOrigin(origin);
-
         Sequence *sequence = dynamic_cast<Sequence*>(track->getSequence());
         BMX_ASSERT(sequence);
         vector<StructuralComponent*> components = sequence->getStructuralComponents();
+
+        TimecodeComponent *timecode_component = 0;
+        if (components.size() == 1)
+            timecode_component = dynamic_cast<TimecodeComponent*>(components[0]);
+
+        // A timecode track counts in frames whilst the clip edit rate is the sampling rate when
+        // clip wrapping, so convert. Both conversions are a no-op when the rates are the same.
+        int64_t track_origin   = origin;
+        int64_t track_duration = duration;
+        if (timecode_component) {
+            track_origin   = tc_track_position(origin, mEditRate, mFrameRate);
+            track_duration = tc_track_duration(duration, mEditRate, mFrameRate);
+        }
+
+        track->setOrigin(track_origin);
+
         if (sequence->getDuration() < 0) {
-            sequence->setDuration(duration);
+            sequence->setDuration(track_duration);
             if (components.size() == 1) {
-                components[0]->setDuration(duration);
+                components[0]->setDuration(track_duration);
             } // else it's a Timed Text track which is handled separately
         }
-        if (components.size() == 1) {
-            TimecodeComponent *timecode_component = dynamic_cast<TimecodeComponent*>(components[0]);
-            if (timecode_component) {
-                Timecode start_timecode = mStartTimecode;
-                start_timecode.AddOffset(- origin, mFrameRate);
-                timecode_component->setRoundedTimecodeBase(start_timecode.GetRoundedTCBase());
-                timecode_component->setDropFrame(start_timecode.IsDropFrame());
-                timecode_component->setStartTimecode(start_timecode.GetOffset());
-            }
+        if (timecode_component) {
+            Timecode start_timecode = mStartTimecode;
+            start_timecode.AddOffset(- track_origin, mFrameRate);
+            timecode_component->setRoundedTimecodeBase(start_timecode.GetRoundedTCBase());
+            timecode_component->setDropFrame(start_timecode.IsDropFrame());
+            timecode_component->setStartTimecode(start_timecode.GetOffset());
         }
     }
 }
